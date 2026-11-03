@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.ContentCopy
@@ -1022,6 +1023,24 @@ fun CallsScreen(
     // call does not have to wait for the next tick.
     var refreshing by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+    // A LazyColumn key has to be unique across the list, and a key built from
+    // the timestamp and the model is not: since the built-in chat started
+    // writing its own turns into this log, one run can finish several calls
+    // inside the same millisecond. A duplicated key is not a cosmetic
+    // problem — LazyColumn throws on it, and because the key is recomputed on
+    // every poll the page dies the moment it is opened. The occurrence count
+    // makes each position distinct while leaving a record that is still there
+    // on the next poll under the same key.
+    val visible = records.asReversed()
+    val rowKeys = remember(records) {
+        val seen = HashMap<String, Int>(visible.size)
+        visible.map { record ->
+            val base = record.timestamp.toString() + ":" + record.model
+            val repeat = seen[base] ?: 0
+            seen[base] = repeat + 1
+            if (repeat == 0) base else base + "#" + repeat
+        }
+    }
     PullToRefreshBox(
         isRefreshing = refreshing,
         onRefresh = {
@@ -1088,7 +1107,7 @@ fun CallsScreen(
                     TextButton(onClick = onOpenModelStats) { Text("模型调用频率") }
                 }
             }
-            items(records.reversed(), key = { it.timestamp.toString() + it.model }) { record ->
+            itemsIndexed(visible, key = { index, _ -> rowKeys[index] }) { _, record ->
                 CallRow(record, state.models)
             }
         }
@@ -1661,19 +1680,22 @@ fun BridgeAdvancedSheet(
                 Switch(checked = state.formatAnthropic, onCheckedChange = onToggleAnthropic)
             }
 
-            if (state.formatAnthropic || state.formatResponses) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("伪装客户端身份", style = MaterialTheme.typography.bodyMedium)
-                        Text(
-                            "上游会拦截 Claude Code 与 Codex 等客户端的身份声明，" +
-                                "开启后这些句子会被改写，其余内容不变。",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    Switch(checked = state.disguiseIdentity, onCheckedChange = onToggleDisguise)
+            // Shown for every dialect, not just the translated ones: the
+            // gateway refuses the same passages whichever protocol the client
+            // speaks, and an OpenAI-compatible client (DSH Go, an editor
+            // plugin, a script) is exactly the case that used to have no way
+            // to turn this on.
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("请求兼容改写", style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        "上游会拦截部分客户端与运行时的自我声明（Claude Code、Codex、DSH 等）。" +
+                            "开启后只改写这几句声明，提示词、工具定义与模型能力都不受影响。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
+                Switch(checked = state.disguiseIdentity, onCheckedChange = onToggleDisguise)
             }
 
             Row(verticalAlignment = Alignment.CenterVertically) {
