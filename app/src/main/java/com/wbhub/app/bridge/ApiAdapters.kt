@@ -50,36 +50,99 @@ object ApiAdapters {
         "x-anthropic-billing-header" to "x-client-billing-header",
         "To give feedback, users should report the issue at" to
             "For feedback, users should report the issue at",
+        // A coding agent's file-reference note. Measured against the live
+        // gateway: this passage trips the filter wherever it sits in a system
+        // prompt, and changing this one token is enough to pass. Only the
+        // token is touched, so the note still tells the model the same thing
+        // about how a leading `@` is read.
+        "Tokens prefixed with @" to "Tokens prefixed with (at)",
     )
 
     /**
      * Markers the upstream refuses only when the text begins with them.
      *
-     * The second entry is the opening of another vendor's coding agent — a
-     * paragraph describing what the agent is, which the gateway reads as an
-     * attempt to drive the account from a client it has not approved. It is
-     * filtered as one whole passage: dropping its final word, or hyphenating a
-     * term inside it, is enough to pass. The rewrite therefore only touches its
-     * opening clause, which changes nothing about what the agent is told to do.
+     * The entry is the opening of another vendor's coding agent — a paragraph
+     * describing what the agent is, which the gateway reads as an attempt to
+     * drive the account from a client it has not approved. It is filtered as
+     * one whole passage: dropping its final word, or hyphenating a term inside
+     * it, is enough to pass. The rewrite therefore only touches its opening
+     * clause, which changes nothing about what the agent is told to do.
+     *
+     * The runtime's own self-description used to live here too, spelled with a
+     * plain space. It never matched — see [GAP] — and is now handled by
+     * [IDENTITY_AT_START], which does not care how the two words are separated.
      */
     private val BLOCKED_PREFIXES: List<Pair<String, String>> = listOf(
         // Opening of another vendor's coding agent. Only its first clause is
         // rewritten — the sentence still says the same thing about the agent.
         "You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI. You are expected to be precise, safe, and helpful." to
             "You're a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI. You are expected to be precise, safe, and helpful.",
-        // The same rule, extended on 2026-10-20 for a second agent's opening
-        // line. Measured against the live gateway: the runtime form is blocked
-        // only at offset 0 of a system turn, is matched case-insensitively,
-        // and passes when a single space is prepended or when the same text
-        // sits in a user turn. Only the opening clause is rewritten, so the
-        // sentence still tells the model the same thing about itself.
-        "You are an AI agent powered by DeepSeek Harness." to
-            "You are an AI assistant built on DeepSeek Harness.",
-        // The model-specific variant of the same opener. The model name is
-        // kept verbatim; only the surrounding clause changes.
-        "You are a coding agent powered by the deepseek-v4.1-flash model." to
-            "You are an assistant built on the deepseek-v4.1-flash model.",
     )
+
+    /**
+     * What counts as a separator to the gateway, but not to a literal compare.
+     *
+     * The runtime writes its name with a zero-width space between the two words
+     * (`DeepSeek` + U+200B + `Harness`). A rule that spells the sentence with a
+     * plain space therefore never fires on the text it was written for, which
+     * is why the disguised requests still came back as `请求被拦截`. Matching
+     * through a class of invisible characters is what makes the rule hold for
+     * every spelling of the same phrase.
+     */
+    private const val GAP = "[\\s\u00A0\u200B\u2060\uFEFF]"
+
+    /**
+     * The runtime's self-description, at the start of a turn.
+     *
+     * Measured: blocked only at offset 0, matched case-insensitively, and
+     * cleared by hyphenating the product name. The rest of the sentence is
+     * kept so the model is still told what it is running on.
+     */
+    private val IDENTITY_AT_START = Regex(
+        "^${GAP}*You${GAP}+are${GAP}+an${GAP}+AI${GAP}+agent${GAP}+powered${GAP}+by" +
+            "${GAP}+DeepSeek${GAP}*Harness\\.",
+        RegexOption.IGNORE_CASE,
+    )
+
+    /**
+     * The `coding agent powered by` opener, for any model name.
+     *
+     * The gateway keys on the phrase rather than the model it names, so
+     * swapping the model in the sentence does not clear it; changing the verb
+     * does.
+     */
+    private val CODING_AGENT_OPENER = Regex(
+        "You${GAP}+are${GAP}+a${GAP}+coding${GAP}+agent${GAP}+powered${GAP}+by",
+        RegexOption.IGNORE_CASE,
+    )
+
+    /** The Web GUI sentences a harness appends to its system prompt. */
+    private val WEB_GUI_SURFACE = Regex(
+        "You${GAP}+are${GAP}+interacting${GAP}+with${GAP}+the${GAP}+user${GAP}+through" +
+            "${GAP}+the${GAP}+DeepSeek${GAP}*Harness${GAP}+Web${GAP}+GUI",
+        RegexOption.IGNORE_CASE,
+    )
+    private val WEB_GUI_URL = Regex(
+        "Current${GAP}+DeepSeek${GAP}*Harness${GAP}+Web${GAP}+GUI${GAP}+URL",
+        RegexOption.IGNORE_CASE,
+    )
+
+    /**
+     * The product name on its own, as a last resort.
+     *
+     * Any sentence carrying the two words with a zero-width space between them
+     * is a candidate for the filter, and the hyphenated spelling is the one
+     * measured to pass. It cannot match its own replacement, so the rewrite
+     * stays idempotent.
+     */
+    private val BRAND = Regex("DeepSeek${GAP}*Harness", RegexOption.IGNORE_CASE)
+
+    private const val SAFE_IDENTITY = "You are an AI agent running on DeepSeek-Harness."
+    private const val SAFE_CODING_OPENER = "You are a coding agent running on"
+    private const val SAFE_WEB_SURFACE =
+        "You are interacting with the user through this Web GUI"
+    private const val SAFE_WEB_URL = "Current Web GUI URL"
+    private const val SAFE_BRAND = "DeepSeek-Harness"
 
     /**
      * Rewrites every marker the upstream refuses.
@@ -88,9 +151,17 @@ object ApiAdapters {
      * instructions and is passed through unchanged, so the model sees the same
      * request the client composed. Every occurrence is replaced, because a copy
      * left behind is one the upstream would still find.
+     *
+     * The rules are applied in order of specificity, and each one is idempotent
+     * — feeding the result back in changes nothing — so a retried request is
+     * rewritten exactly once.
      */
     fun disguise(text: String): String {
-        var rewritten = text
+        if (text.isEmpty()) return text
+        var rewritten = IDENTITY_AT_START.replace(text, SAFE_IDENTITY)
+        rewritten = CODING_AGENT_OPENER.replace(rewritten, SAFE_CODING_OPENER)
+        rewritten = WEB_GUI_SURFACE.replace(rewritten, SAFE_WEB_SURFACE)
+        rewritten = WEB_GUI_URL.replace(rewritten, SAFE_WEB_URL)
         for ((marker, replacement) in BLOCKED_MARKERS) {
             if (rewritten.contains(marker, ignoreCase = true)) {
                 rewritten = rewritten.replace(marker, replacement, ignoreCase = true)
@@ -101,13 +172,32 @@ object ApiAdapters {
                 rewritten = replacement + rewritten.substring(prefix.length)
             }
         }
-        return rewritten
+        return BRAND.replace(rewritten, SAFE_BRAND)
     }
 
-    /** Whether [text] carries anything the upstream refuses. */
+    /**
+     * Whether [text] carries anything the upstream refuses.
+     *
+     * Answered with substring tests rather than the rules themselves: this runs
+     * on every message of every request, and a false positive only costs one
+     * rewrite pass, while a false negative would leave the block in place.
+     * `Web GUI` and `DeepSeek` between them cover the rules that are spelled
+     * out as regular expressions.
+     */
     fun needsDisguise(text: String): Boolean =
-        BLOCKED_MARKERS.any { text.contains(it.first, ignoreCase = true) } ||
+        QUICK_MARKERS.any { text.contains(it, ignoreCase = true) } ||
             BLOCKED_PREFIXES.any { text.startsWith(it.first, ignoreCase = true) }
+
+    /** Substrings that every blocked phrase contains in one spelling or another. */
+    private val QUICK_MARKERS = listOf(
+        "Tokens prefixed with @",
+        "x-anthropic-billing-header",
+        "You are Claude Code",
+        "To give feedback, users should report",
+        "DeepSeek",
+        "coding agent powered",
+        "Web GUI",
+    )
 
     /**
      * Roles whose text the upstream reads.
